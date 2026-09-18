@@ -1,0 +1,751 @@
+---
+title: "Bayesian Project"
+author: "Nicholas Bartolucci"
+date: "May 2026"
+output: 
+  pdf_document:
+    toc: true
+    number_sections: true
+header-includes:
+  - \usepackage{amsmath}
+  - \usepackage{booktabs}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+```{r libraries, message=FALSE, warning=FALSE, include=FALSE}
+# ssshhh this is a library
+library(tidyverse)
+library(cmdstanr)
+library(posterior)
+library(bayesplot)
+library(loo)
+library(conflicted)
+library(ggplotify)
+library(dplyr)
+
+color_scheme_set("brightblue")
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::lag)
+conflicts_prefer(stats::sd)
+conflicts_prefer(stats::var)
+conflicts_prefer(posterior::rhat)
+```
+
+
+# Introduction
+
+Hierarchical Bayesian models occupy an important position in applied statistics: they are simultaneously a modeling choice and a philosophical stance on how information interacts between related groups. The core idea is simple. When estimating group-specific parameters, such as regional claim rates, school effects, and patient-level responses, the analyst faces a fundamental tension. Treating each group as entirely independent ignores the fact that groups often share a common data-generating process, discarding useful information and producing unstable estimates especially for sparse groups. Treating all groups as identical imposes a structure that is almost certainly wrong, masking heterogeneity behind a single estimate. Hierarchical models resolve this through partial pooling: each group's estimate is shrunk toward a collective mean, with the level of shrinkage determined by the amount of data the group contributes relative to the estimated variability across groups. Data-rich groups speak largely for themselves; data-sparse groups borrow strength from the collective.
+
+This partial pooling mechanism has a precise classical analogue, notably, one related to my person interest in actuarial science, which inspired my choice for this project. Bühlmann credibility theory, developed in actuarial literature in the 1960s, derives the optimal estimator of a group's true risk rate under squared error loss as a weighted combination of the group's own experience and the collective mean, with the weight (credibility factor $Z_r$) determined by the ratio of within-group and between-group variance. Under certain conditions this estimator is analytically equivalent to the posterior mean of a Bayesian hierarchical model, connecting a result derived for insurance pricing to the broader topic of modern Bayesian inference used in class.
+
+The practical difficulty with hierarchical models is that partial pooling is governed by a variance component, $\sigma_u$, which controls how much groups are allowed to deviate from the collective mean. This parameter is informed by the group-level data alone: regardless of how many individual observations are available, $\sigma_u$ is identified only by the number of groups. This bottleneck has a direct consequence for Bayesian inference - the prior placed on $\sigma_u$ remains influential for longer than priors on individual-level parameters, and may dominate inference entirely when a researcher lacks a sufficient amount of group-level data. Determining when prior choice on $\sigma_u$ matters, and when the likelihood renders it irrelevant, is one of the central questions this project addresses.
+
+# Data Description
+
+This analysis uses the freMTPL2freq dataset to investigate whether hierarchical Bayesian modeling improves estimation of regional auto insurance claim frequencies relative to a flat pooled model. Specifically, the research question is: does partial pooling across regions reduce posterior uncertainty in claim rate estimates, and under what data conditions does the choice of prior on regional variance matter? To answer this, three models are fit: a flat Poisson GLM, and two hierarchical Poisson GLMs differing only in their prior on $\sigma_u$. We look at these models across four sample sizes ranging from $N = 500$ to $N = 676,789$, with results connected to classical Bühlmann credibility theory.
+
+The dataset freMTPL2freq is sourced from the CASdatasets R package and made available via Kaggle. It contains $678,013$ French motor third-party liability insurance policies observed over one year. Each row represents a single policy with the following variables:
+
+
+\begin{itemize}
+  \item \textbf{ClaimNb}: number of claims filed during the exposure period (response variable)
+  \item \textbf{Exposure}: policy duration in years, used as an offset
+  \item \textbf{DrivAge}: driver age in years
+  \item \textbf{BonusMalus}: French no-claims discount score (50–350); values below 100 indicate a claims-free bonus, above 100 a malus
+  \item \textbf{VehPower}: vehicle power (ordered categorical)
+  \item \textbf{VehAge}: vehicle age in years
+  \item \textbf{VehGas}: fuel type (Diesel or Regular), encoded as binary
+  \item \textbf{Density}: population density of the driver's municipality, log-transformed
+  \item \textbf{Region}: one of 21 French administrative regions, used as the grouping variable for hierarchical modeling
+\end{itemize}
+
+```{r load-data}
+freMTPL2freq <- read_csv("freMTPL2freq.csv")
+```
+
+\textbf{Data cleaning:} $1,224$ policies with exposure exceeding one year were removed as they were likely data anomalies, leaving $N = 676,789$ policies for analysis. Continuous predictors were standardised to have mean zero and unit variance prior to modeling.
+
+```{r cleanup, echo=FALSE}
+df <- freMTPL2freq %>%
+
+  filter(Exposure > 0, Exposure <= 1) %>%
+
+  mutate(
+    log_density = log(Density),
+
+    VehGas_bin = ifelse(VehGas == "Diesel", 1, 0),
+
+    Region_idx = as.integer(factor(Region))
+  ) %>%
+
+  mutate(across(
+    c(DrivAge, BonusMalus, VehPower, VehAge, log_density),
+    scale
+  ))
+
+region_lookup <- df %>%
+  distinct(Region, Region_idx) %>%
+  arrange(Region_idx)
+
+# dims
+N <- nrow(df)
+R <- n_distinct(df$Region_idx)
+```
+
+```{r eda}
+
+# policies per region
+region_summary <- freMTPL2freq %>%
+  group_by(Region) %>%
+  summarise(
+    n_policies   = n(),
+    total_claims = sum(ClaimNb),
+    exposure     = sum(Exposure),
+    claim_rate   = total_claims / exposure
+  ) %>%
+  arrange(desc(claim_rate))
+
+region_summary %>%
+  knitr::kable(digits = 3,
+    caption = "Claim rates by French region",
+    col.names = c("Region", "Policies", "Claims", 
+                  "Exposure", "Claim Rate"),
+    booktabs = TRUE)
+
+# global mean 
+global_rate <- sum(freMTPL2freq$ClaimNb) / sum(freMTPL2freq$Exposure)
+cat("Global claim rate:", round(global_rate, 4), "\n")
+```
+
+Table 1 reveals substantial heterogeneity in claim rates across the $21$ French regions, ranging from $0.081$ in Auvergne to $0.140$ in Corse, creating a $72\%$ spread around the global mean of $0.1007$. Critically, this variation is confounded with portfolio size: Corse and Champagne-Ardenne, the two highest-rate regions, have only $4,516$ and $3,026$ policies respectively, while Centre, the largest region, contributes $160,601$ policies at a below-average rate of $0.090$. Raw claim rates for small regions are therefore unreliable estimates of true underlying risk, being highly sensitive to a handful of claims. This tension between data sparsity and regional heterogeneity motivates the hierarchical modeling approach developed in our analysis, where partial pooling allows small regions to borrow strength from the collective experience while large regions are largely governed by their own data.
+ 
+To tackle the research question, three models are fit and compared: a flat Poisson GLM imposing complete pooling across regions, a hierarchical Poisson GLM with a weakly informative prior on the regional variance component $\sigma_u \sim Half-Normal(0, 0.5)$, and a hierarchical Poisson GLM with an informative prior $\sigma_u \sim Half-Normal(0, 0.1)$. Although a gamma prior is a natural choice for model conjugacy regarding precision parameters, we selected a half-normal prior for computational behaviour, and direct interpretability regarding variation. This is often recommended by Gelman et al. (2006) and is standard practice for hierarchical stan models. All three share identical priors on the intercept and fixed effects. To isolate the role of sample size in prior sensitivity, each model is refit on four subsets of the data: $N = 500$, $N = 2,000$, $N = 10,000$, and the full $N = 676,789$. Posterior uncertainty in regional claim rate estimates is the primary quantity of interest, with shrinkage behaviour and prior sensitivity assessed as a function of $N$. Results are further connected to classical Bühlmann credibility theory to provide an actuarial interpretation of the partial pooling mechanism.
+
+# Prior Choice
+
+
+We adopt weakly informative priors throughout:
+
+$$\beta_j \sim N(0, 1), \quad j = 1, \dots, 6$$
+
+Using the Poisson model, this places $95\%$ prior mass between $e^{-2} \approx 0.14$ 
+and $e^{2} \approx 7.4$, wide enough to be non-informative in practice.
+
+For the intercept we incorporate actuarial industry knowledge. The global claim rate is approximately $0.10$ claims per exposure year, implying a log baseline of $\log(0.10) \approx -2.3$. We therefore set:
+
+$$\alpha \sim \mathcal{N}(-2, 0.5)$$
+
+placing $95\%$ prior mass on baseline rates between $e^{-3} \approx 0.05$ and $e^{-1} \approx 0.37$, which is consistent with typical motor insurance claim frequencies.
+
+The flat Poisson GLM uses identical priors on the intercept and fixed effects, with $\alpha \sim N(-2,0.5)$ and $\beta_j \sim N(0,1)$, but contains no regional structure and therefore no variance component. This acts as a complete pooling baseline for which the hierarchical models will be compared.
+
+The parameter $\sigma_u$ controls heterogeneity across the $21$ French regions. Critically, $\sigma_u$ is informed by only $21$ group-level estimates regardless of total $N$, hence this is where prior choice genuinely matters. We compare two priors:
+
+\textbf{Prior 1 — Weakly Informative:}
+$$\sigma_u \sim \text{Half-Normal}(0, 0.5)$$
+
+This allows regions to differ substantially if supported by the data, with $\sigma_u = 0.5$ implying rate ratios of up to $e^{0.5} \approx 1.65$ between regions, which is not implausible.
+
+\textbf{Prior 2 — Informative:}
+$$\sigma_u \sim \text{Half-Normal}(0, 0.1)$$
+
+With this we express the belief that regions are largely similar, placing $95\%$ of prior mass below $\sigma_u \approx 0.196$. On the credibility scale this corresponds to a strong prior belief that regional observations should be heavily discounted in favour of collective experience, equivalent to assuming low Bühlmann credibility factors $Z_r$.
+
+Whether the prior choice materially affects inference depends on how much data is available to estimate $\sigma_u$. Our later analysis investigates this directly by refitting all three models across sample sizes ranging from $N = 500$ to $N = 676,789$, revealing precisely when the prior on $\sigma_u$ dominates and when the likelihood renders it irrelevant.
+
+
+
+# Analysis
+Three models are compared across four sample sizes to isolate the conditions under which hierarchical modeling and prior choice materially affect inference. The complete pooling model ignores regional structure entirely, estimating a single baseline adjusted for covariates. The two hierarchical models introduce region-level random effects that shrink regional estimates toward the global mean, differing only in the variance of the prior placed on $\sigma_u$ - the parameter governing how much regions are permitted to deviate from that mean. For each sample size, three outputs are presented: a shrinkage plot showing how each model's posterior regional rates relate to the raw rates, a summary table quantifying posterior uncertainty, and a density plot comparing the two hierarchical posteriors for $\sigma_u$.
+```{r load-fits}
+fit_flat        <- readRDS("fit_flat.rds")
+fit_hier_weak   <- readRDS("fit_hier_weak.rds")
+fit_hier_inform <- readRDS("fit_hier_inform.rds")
+```
+
+```{r load-small-samples}
+# subsamples
+df_500 <- readRDS("df_prop_500.rds")
+df_2k  <- readRDS("df_prop_2k.rds")
+df_10k <- readRDS("df_prop_10k.rds")
+
+# flat
+fit_500_flat <- readRDS("fit_prop_500_flat.rds")
+fit_2k_flat  <- readRDS("fit_prop_2k_flat.rds")
+fit_10k_flat <- readRDS("fit_prop_10k_flat.rds")
+
+# hierarchical weak
+fit_500_weak <- readRDS("fit_prop_500_weak.rds")
+fit_2k_weak  <- readRDS("fit_prop_2k_weak.rds")
+fit_10k_weak <- readRDS("fit_prop_10k_weak.rds")
+
+# hierarchical informative
+fit_500_inform <- readRDS("fit_prop_500_inform.rds")
+fit_2k_inform  <- readRDS("fit_prop_2k_inform.rds")
+fit_10k_inform <- readRDS("fit_prop_10k_inform.rds")
+```
+
+The hierarchical model introduces region-level random effects $u_r$, allowing claim rates to vary across the 21 French regions while borrowing information from partial pooling. The model is specified as:
+
+$$Y_i \sim \text{Poisson}(\lambda_i \cdot e_i)$$
+$$\log(\lambda_i) = \alpha + \mathbf{x}_i^\top\boldsymbol{\beta} + u_{r[i]}$$
+$$u_r \sim \mathcal{N}(0, \sigma_u^2), \quad r = 1, \dots, 21$$
+
+A non-centered parameterisation is employed for numerical stability:
+$$u_r = \sigma_u \cdot \tilde{u}_r, \quad \tilde{u}_r \sim \mathcal{N}(0,1)$$
+```{r stan-data}
+stan_data <- list(
+  N        = N,
+  R        = R,
+  y        = as.integer(df$ClaimNb),
+  exposure = df$Exposure,
+  X        = as.matrix(dplyr::select(df, DrivAge, BonusMalus, VehPower, VehAge, log_density, VehGas_bin)),
+  K        = 6,
+  region   = as.integer(df$Region_idx)
+)
+
+stan_data_weak   <- c(stan_data, list(sigma_scale = 0.5))
+stan_data_inform <- c(stan_data, list(sigma_scale = 0.1))
+``` 
+
+```{r comparison}
+compare_models <- function(df_s, fit_flat, fit_weak, fit_inform, label) {
+  
+  global_rate <- sum(df_s$ClaimNb) / sum(df_s$Exposure)
+  
+  # flat 
+ draws_flat <- fit_flat$post_warmup_draws
+  
+  alpha_flat <- summarise_draws(draws_flat) %>%
+    filter(variable == "alpha") %>% pull(mean)
+  
+  beta_flat <- summarise_draws(draws_flat) %>%
+    filter(grepl("^beta\\[", variable)) %>%
+    pull(mean)
+  
+  # posterior regional mean 
+  flat_df <- df_s %>%
+    group_by(Region_idx) %>%
+    summarise(
+      raw_rate = sum(ClaimNb) / sum(Exposure),
+      n        = n(),
+      across(c(DrivAge, BonusMalus, VehPower, VehAge, log_density, VehGas_bin), mean)
+    ) %>%
+    mutate(
+      X_r            = as.matrix(dplyr::select(., DrivAge, BonusMalus, VehPower, 
+                                                VehAge, log_density, VehGas_bin)),
+      posterior_rate = exp(alpha_flat + X_r %*% beta_flat),
+      posterior_sd   = sd(as_draws_df(draws_flat)$alpha),
+      model          = "Complete Pooling (Flat)"
+    ) %>%
+    dplyr::select(Region_idx, raw_rate, n, posterior_rate, posterior_sd, model)
+  
+  #  weak
+  draws_weak <- fit_weak$post_warmup_draws
+  
+  alpha_weak <- summarise_draws(draws_weak) %>%
+    filter(variable == "alpha") %>% pull(mean)
+  
+  u_weak <- summarise_draws(draws_weak) %>%
+    filter(grepl("^u\\[", variable)) %>%
+    mutate(Region_idx = as.integer(gsub("u\\[|\\]", "", variable)))
+  
+  weak_df <- df_s %>%
+    group_by(Region_idx) %>%
+    summarise(raw_rate = sum(ClaimNb) / sum(Exposure), n = n()) %>%
+    left_join(dplyr::select(u_weak, Region_idx, mean, sd), by = "Region_idx") %>%
+    mutate(
+      posterior_rate = exp(alpha_weak + mean),
+      posterior_sd   = sd,
+      model          = "Partial Pooling (Weak Prior)"
+    )
+  
+  #  informative 
+  draws_inform <- fit_inform$post_warmup_draws
+  
+  alpha_inform <- summarise_draws(draws_inform) %>%
+    filter(variable == "alpha") %>% pull(mean)
+  
+  u_inform <- summarise_draws(draws_inform) %>%
+    filter(grepl("^u\\[", variable)) %>%
+    mutate(Region_idx = as.integer(gsub("u\\[|\\]", "", variable)))
+  
+  inform_df <- df_s %>%
+    group_by(Region_idx) %>%
+    summarise(raw_rate = sum(ClaimNb) / sum(Exposure), n = n()) %>%
+    left_join(dplyr::select(u_inform, Region_idx, mean, sd), by = "Region_idx") %>%
+    mutate(
+      posterior_rate = exp(alpha_inform + mean),
+      posterior_sd   = sd,
+      model          = "Partial Pooling (Informative Prior)"
+    )
+  
+  #  combine 
+  comparison_df <- bind_rows(flat_df, weak_df, inform_df) %>%
+  mutate(model = factor(model, levels = c(
+    "Complete Pooling (Flat)",
+    "Partial Pooling (Weak Prior)",
+    "Partial Pooling (Informative Prior)"
+  )))
+  
+  #  shrinkage 
+ p1 <- ggplot(comparison_df, aes(x = raw_rate, y = posterior_rate)) +
+  geom_abline(slope = 1, intercept = 0, color = "grey50") +
+  geom_hline(yintercept = global_rate, linetype = "dashed",
+             color = "red", alpha = 0.5) +
+  geom_segment(aes(xend = raw_rate, yend = global_rate),
+               alpha = 0.3, linetype = "dashed") +
+  geom_point(aes(size = n), alpha = 0.7, color = "#2C7BB6") +
+  facet_wrap(~ model) +
+  coord_cartesian(xlim = c(0, 0.45)) +          # add this line
+  labs(
+    title    = paste("Three-Way Comparison at N =", label),
+    subtitle = "Red dashed = global mean; diagonal = raw rate\nNote: raw rates > 0.45 omitted (1-policy sampling artifacts)",
+    x = "Raw Claim Rate",
+    y = "Posterior Mean Claim Rate",
+    size = "Policies"
+  ) +
+  theme_minimal() +
+  theme(plot.title   = element_text(face = "bold"),
+        strip.text   = element_text(face = "bold"))
+  
+  print(p1)
+  
+  #summary
+  tbl <- comparison_df %>%
+    group_by(model) %>%
+    summarise(
+      `Mean Posterior SD`        = round(mean(posterior_sd, na.rm = TRUE), 4),
+      `Range of Posterior Means` = round(max(posterior_rate) - min(posterior_rate), 4)
+    )
+  
+  print(knitr::kable(
+    tbl,
+    caption   = paste("Posterior Uncertainty at N =", label, ": Three-Way Comparison"),
+    col.names = c("Model", "Mean Posterior SD", "Range of Posterior Means"),
+    booktabs  = TRUE
+  ))
+  
+  # sig u  
+  sigma_df <- bind_rows(
+    as_draws_df(draws_weak)   %>% dplyr::select(sigma_u) %>% mutate(prior = "Weakly Informative"),
+    as_draws_df(draws_inform) %>% dplyr::select(sigma_u) %>% mutate(prior = "Informative")
+  )
+  
+  p2 <- ggplot(sigma_df, aes(x = sigma_u, fill = prior)) +
+    geom_density(alpha = 0.6) +
+    labs(
+      title = bquote("Posterior of " ~ sigma[u] ~ " at N = " ~ .(label) ~ " — Prior Sensitivity"),
+      x     = expression(sigma[u]),
+      y     = "Density",
+      fill  = "Prior"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold"))
+  
+  print(p2)
+}
+```
+
+We note that the standard deviations report by the models report are fundamentally different objects. In the complete pooling model, every region shares a single global intercept, so the posterior SD reflects uncertainty about that one scalar parameter, being the same value replicated across all 21 regions. In the hierarchical models, the posterior SD is region-specific: it reflects uncertainty about each region's deviation from the global mean, a parameter that must be estimated from that region's data alone. A smaller posterior SD in the flat model therefore does not indicate greater precision about regional risk; it indicates that the flat model has collapsed all regional heterogeneity into a single number and is expressing confidence about that number, while remaining silent about genuine between-region variation. Similarly, the range of posterior means measures something different in each case: for the flat model it reflects covariate-driven differences in regional profiles, while for the hierarchical models it reflects the regional effects after partial pooling toward the global mean. Both metrics are informative within each model, but cross-model comparisons should be read as descriptions of what each model is doing rather than a strict precision ranking.
+
+## Small sample, N=500
+
+```{r small}
+compare_models(df_500, fit_500_flat, fit_500_weak, fit_500_inform, "500")
+```
+
+
+At $N = 500$, with proportional stratified sampling giving Centre roughly $119$ policies and Franche-Comté only $1$, raw claim rates are highly unstable, ranging from $0.10$ to over $0.34$ across regions. The complete pooling model partially recovers regional variation through covariate adjustment, producing a range of posterior means of $0.100$, but with no shrinkage mechanism its estimates track the covariate-driven signal regardless of how little data underlies each region. The weak hierarchical prior reduces this range substantially to $0.037$, reflecting the stabilising effect of partial pooling as regions borrow strength from collective experience. The informative prior goes considerably further, collapsing the range to just $0.005$ — essentially imposing complete pooling in practice. At this sample size the likelihood over $\sigma_u$ is too weak to overcome the prior belief that regions are similar, so the informative model discards nearly all regional signal. The $\sigma_u$ density plot makes this explicit: the two hierarchical posteriors are visibly separated, with the informative prior concentrating near zero while the weak prior allows for a long right tail. Whether the shrinkage of the informative prior is desirable depends entirely on whether the actuarial belief that French regions are largely homogeneous in risk is actually correct. Crucially, this question is hardest to answer precisely when it matters most: at small $N$, where the data cannot adjudicate between the two priors, the analyst's belief about regional heterogeneity is the dominant driver of inference.
+
+
+## Moderate sample, N=2000
+```{r moderate}
+compare_models(df_2k, fit_2k_flat, fit_2k_weak, fit_2k_inform, "2000")
+```
+
+At $N = 2,000$, the raw rates stabilise somewhat but remain noisy. The key development relative to $N = 500$ is that the two hierarchical models begin to converge: the gap between the informative prior range $(0.004)$ and the weak prior range $(0.013)$ has narrowed from $0.032$ at $N = 500$ to $0.009$ here, as the likelihood accumulates enough information to begin overriding the tight prior on $\sigma_u$. The $\sigma_u$ density plot shows the posteriors still clearly separated, but the informative prior's peak has shifted slightly rightward as the data pushes back against the prior belief that regions are homogeneous. The complete pooling model's range $(0.040)$ now exceeds the weak hierarchical range $(0.013)$, confirming that partial pooling is already giving more coherent regional estimates than the covariates alone — the hierarchical model's shrinkage is earning its complexity cost even at moderate sample sizes.
+
+## Large sample, N=10000
+```{r large}
+compare_models(df_10k, fit_10k_flat, fit_10k_weak, fit_10k_inform, "10000")
+```
+
+At $N = 10,000$ proportional allocation gives Centre over 2,300 policies while the smallest regions still receive only a handful, and the likelihood is strong enough to meaningfully inform $\sigma_u$ under both priors. The gap between the two hierarchical models continues to close: the informative prior range $(0.017)$ is now approaching the weak prior range $(0.025)$, compared to a gap of $0.009$ at $N = 2,000$ and $0.032$ at $N = 500$. The $\sigma_u$ density plot shows the two posteriors overlapping significantly, with both concentrated in the $(0.1,0.3)$ range — the data is actively overriding the prior's preference for near-zero regional variance. The weak hierarchical model's shrinkage plot now tracks the diagonal more closely than at smaller $N$, reflecting that the larger regions have garnered enough data to resist excessive pooling, while the smallest regions remain appropriately shrunk toward the global mean. The size variation introduced by proportional sampling is now visible in the shrinkage plots: larger regions sit closer to the diagonal while smaller regions are pulled more strongly toward the global mean, a pattern that was invisible under the original equal-stratification design.
+
+## Full sample, N=676k
+```{r full}
+ compare_models(df, fit_flat, fit_hier_weak, fit_hier_inform, "676k")
+```
+With $N = 676,789$ observations the likelihood completely dominates both priors. The two hierarchical models are now virtually indistinguishable: posterior ranges of $0.027$ and $0.026$, and mean posterior SDs of $0.042$ and $0.041$ respectively. The $\sigma_u$ density plot shows nearly complete overlap, with posterior means of $0.085$ (weak) and $0.084$ (informative), a negligible difference. Prior choice on $\sigma_u$ is therefore inconsequential at full sample size; any reasonable prior would yield the same result. The complete pooling model retains a range of $0.041$ driven purely by covariate heterogeneity across regions, but remains blind to regional structure. The labeled shrinkage plot below shows the full-sample hierarchical estimates by region, illustrating how partial pooling allocates trust between regional experience and collective knowledge as a function of portfolio size.
+
+```{r label}
+draws_weak <- fit_hier_weak$post_warmup_draws
+
+u_summary <- summarise_draws(draws_weak) %>%
+  filter(grepl("^u\\[", variable)) %>%
+  mutate(Region_idx = as.integer(gsub("u\\[|\\]", "", variable))) %>%
+  left_join(region_lookup, by = "Region_idx")
+
+global_rate <- sum(df$ClaimNb) / sum(df$Exposure)
+
+shrinkage_df <- df %>%
+  group_by(Region_idx) %>%
+  summarise(raw_rate = sum(ClaimNb) / sum(Exposure), n = n()) %>%
+  left_join(region_lookup, by = "Region_idx") %>%
+  left_join(dplyr::select(u_summary, Region_idx, mean), by = "Region_idx") %>%
+  mutate(posterior_rate = exp(log(global_rate) + mean))
+
+ggplot(shrinkage_df, aes(x = raw_rate, y = posterior_rate)) +
+  geom_segment(aes(xend = raw_rate, yend = global_rate),
+               alpha = 0.3, linetype = "dashed") +
+  geom_point(aes(size = n), alpha = 0.7, color = "#2C7BB6") +
+  geom_abline(slope = 1, intercept = 0, color = "grey50") +
+  geom_hline(yintercept = global_rate, linetype = "dashed",
+             color = "red", alpha = 0.5) +
+  geom_text(aes(label = Region), size = 2.5, hjust = -0.1) +
+  labs(
+    title    = "Shrinkage Plot — Partial Pooling by Region (Full Sample)",
+    subtitle = "Posterior means shrunk toward global mean (red); size proportional to policies",
+    x        = "Raw Claim Rate",
+    y        = "Posterior Mean Claim Rate",
+    size     = "Policies"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+```
+
+
+Taken together, the four sample sizes tell a coherent story about the interplay between data, prior, and pooling. At $N = 500$ the informative prior dominates, effectively imposing complete pooling regardless of the model specification — the likelihood is too weak to resist it. By $N = 2,000$ the data begins to push back, and by $N = 10,000$ the two hierarchical models are converging as the likelihood progressively overwhelms the prior on $\sigma_u$. At full sample size the distinction between the two priors is negligible. The practical implication is clear: prior choice on $\sigma_u$ matters most precisely when data is scarcest, the small portfolio setting where actuarial judgment is most needed and least verifiable. In such settings the choice between a weakly informative and an informative prior is not a technical detail but an important decision about how much regional heterogeneity the analyst is willing to believe exists before seeing the data.
+
+
+# Convergence Diagnostics
+
+Convergence diagnostics were assessed using three standard criteria: the $\hat{R}$ values, effective sample size, and sampler divergences. All twelve tests (three models across four sample sizes) satisfy the criteria, giving an analysis that rests on well-mixed, well-identified posterior distributions.
+```{r vergence}
+# label fits 
+fit_list <- list(
+  list(fit = fit_500_flat,    label = "500",   model = "Complete Pooling (Flat)"),
+  list(fit = fit_500_weak,    label = "500",   model = "Partial Pooling (Weak Prior)"),
+  list(fit = fit_500_inform,  label = "500",   model = "Partial Pooling (Informative Prior)"),
+  list(fit = fit_2k_flat,     label = "2000",  model = "Complete Pooling (Flat)"),
+  list(fit = fit_2k_weak,     label = "2000",  model = "Partial Pooling (Weak Prior)"),
+  list(fit = fit_2k_inform,   label = "2000",  model = "Partial Pooling (Informative Prior)"),
+  list(fit = fit_10k_flat,    label = "10000", model = "Complete Pooling (Flat)"),
+  list(fit = fit_10k_weak,    label = "10000", model = "Partial Pooling (Weak Prior)"),
+  list(fit = fit_10k_inform,  label = "10000", model = "Partial Pooling (Informative Prior)"),
+  list(fit = fit_flat,        label = "676k",  model = "Complete Pooling (Flat)"),
+  list(fit = fit_hier_weak,   label = "676k",  model = "Partial Pooling (Weak Prior)"),
+  list(fit = fit_hier_inform, label = "676k",  model = "Partial Pooling (Informative Prior)")
+)
+
+conv_table <- purrr::map_dfr(fit_list, function(x) {
+  draws <- x$fit$post_warmup_draws
+  diag  <- summarise_draws(draws, rhat, ess_bulk, ess_tail)
+  
+  tibble(
+    N              = x$label,
+    Model          = x$model,
+    `Max Rhat`     = round(max(diag$rhat,      na.rm = TRUE), 3),
+    `Min ESS Bulk` = round(min(diag$ess_bulk,  na.rm = TRUE), 0),
+    `Min ESS Tail` = round(min(diag$ess_tail,  na.rm = TRUE), 0),
+    Divergences    = sum(x$fit$sampler_diagnostics[,,"divergent__"], na.rm = TRUE)
+  )
+})
+
+knitr::kable(
+  conv_table,
+  caption   = "Convergence diagnostics across all models and sample sizes",
+  col.names = c("N", "Model", "Max Rhat", "Min ESS Bulk", "Min ESS Tail", "Divergences"),
+  booktabs  = TRUE
+)
+```
+Table 2 confirms clean convergence throughout. Every $\hat{R}$ falls at or below $1.005$, no divergences are recorded at any sample size or model specification, and all ESS values, bulk and tail, comfortably exceed $400$. Two structural patterns are visible but neither indicates a sampling problem. First, hierarchical models consistently produce lower ESS bulk than the flat model at the same $N$: this reflects the additional posterior geometry introduced by $21$ region-level parameters and their shared variance component $\sigma_u$, which creates mild funnel-shaped dependencies that a flat model never encounters. Notably, ESS tail for the hierarchical models often exceeds ESS bulk, especially at $N=500$ where the weak prior gives bulk $1,781$ but tail $2,134$, which is the opposite of the pattern one would expect if the funnel geometry were causing tail mixing problems. This confirms that the non-centered parameterisation $u_r = \sigma_u \tilde{u}_r$ is doing its job: the sampler explores the tails of $\sigma_u$ efficiently even at small $N$, and no pathological tail behaviour is present. Second, ESS tends to decrease as $N$ grows, particularly for the hierarchical models at $N=676k$. This is a geometry effect, not a sampler failure since at very large $N$ the posterior concentrates sharply and the chains must take finer steps, reducing the number of effectively independent draws per iteration. The values of $706$ and $730$ at full sample size remain above the threshold for reliable posterior summarisation and their tail ESS values of $1,194$ and $1,188$ confirm that inference on $\sigma_u$ is equally reliable.
+```{r flat diag}
+draws_flat_500 <- fit_500_flat$post_warmup_draws
+
+mcmc_trace(draws_flat_500,
+           pars = c("alpha", "beta[1]", "beta[2]", "beta[3]", 
+                    "beta[4]", "beta[5]", "beta[6]")) +
+  labs(
+    title = "Trace Plots — Complete Pooling (Flat), N = 500"
+  )
+```
+
+```{r heir diag}
+
+mcmc_trace(fit_500_weak$post_warmup_draws,
+           pars = c("alpha", "beta[2]", "u[9]", "u[3]")) +
+  labs(title    = "Trace Plots — Weak Prior, N = 500",
+       subtitle = "u[9] = Corse, u[3] = Auvergne. sigma_u shown separately.")
+
+mcmc_trace(fit_500_inform$post_warmup_draws,
+           pars = c("alpha", "beta[2]", "u[9]", "u[3]")) +
+  labs(title    = "Trace Plots — Informative Prior, N = 500",
+       subtitle = "u[9] = Corse, u[3] = Auvergne. sigma_u shown separately.")
+```
+
+The trace plots at $N = 500$ reflect the theoretical properties of each model. The flat model's parameters mix cleanly by construction: with no group structure to estimate, the posterior geometry is simple and the four chains overlap immediately. The hierarchical parameters (global intercept, fixed effects, regional deviations) also mix well, with chains overlapping and traversing the full posterior support without sticking. The regional effects for Corse $(u_9)$ and Auvergne $(u_3)$ are shown as illustrative examples; $\sigma_u$ traces are displayed separately in the panels below, as its mixing behaviour across sample sizes warrants dedicated attention.
+```{r sigma-traces, fig.show='hold', out.width='49%', fig.height=3, fig.align='left'}
+p1 <- mcmc_trace(fit_500_weak$post_warmup_draws,   pars = "sigma_u") + labs(title = "N = 500, Weak Prior") + theme(legend.position = "none",
+  axis.title.y    = element_blank()
+)
+p2 <- mcmc_trace(fit_500_inform$post_warmup_draws, pars = "sigma_u") + labs(title = "N = 500, Informative Prior") + theme(legend.position = "none",
+  axis.title.y    = element_blank()
+)
+p3 <- mcmc_trace(fit_2k_weak$post_warmup_draws,    pars = "sigma_u") + labs(title = "N = 2000, Weak Prior") + theme(legend.position = "none",
+ axis.title.y    = element_blank()
+)
+p4 <- mcmc_trace(fit_2k_inform$post_warmup_draws,  pars = "sigma_u") + labs(title = "N = 2000, Informative Prior") + theme(legend.position = "none",
+  axis.title.y    = element_blank()
+)
+p5 <- mcmc_trace(fit_10k_weak$post_warmup_draws,   pars = "sigma_u") + labs(title = "N = 10000, Weak Prior") + theme(legend.position = "none",
+   axis.title.y    = element_blank()
+)
+p6 <- mcmc_trace(fit_10k_inform$post_warmup_draws, pars = "sigma_u") + labs(title = "N = 10000, Informative Prior") + theme(legend.position = "none",
+  axis.title.y    = element_blank()
+)
+p7 <- mcmc_trace(fit_hier_weak$post_warmup_draws,  pars = "sigma_u") + labs(title = "N = 676k, Weak Prior") + theme(legend.position = "none",
+axis.title.y    = element_blank()
+)
+p8 <- mcmc_trace(fit_hier_inform$post_warmup_draws,pars = "sigma_u") + labs(title = "N = 676k, Informative Prior") + theme(legend.position = "none",
+  axis.title.y    = element_blank()
+)
+
+p1
+p3
+p5
+p7
+```
+```{r sigma-traces2, fig.show='hold', out.width='49%', fig.height=3, fig.align='left'}
+p2
+p4
+p6
+p8
+```
+The $\sigma_u$ traces tell a coherent story across all eight panels. Because $\sigma_u$ is identified by only $21$ group-level estimates regardless of total $N$, the posterior retains a mild funnel geometry throughout---near-zero values of $\sigma_u$ compress the regional deviations toward a degenerate surface independent of how much individual-level data accumulates. The non-centered parameterisation $u_r = \sigma_u \tilde{u}_r$ directly addresses this geometry, which is why no divergences are recorded even at $N=500$. As $N$ grows, the likelihood becomes more informative about the regional spread, the posterior for $\sigma_u$ concentrates away from zero, the funnel neck is cut off by the data, and the near-zero excursions disappear. By $N=676k$ both sets of chains are tight, stationary, and indistinguishable from one another; consistent with the $\hat{R}$ and ESS values in Table 2 and with the convergence observed in our analysis.
+```{r posterior}
+ppc_summary_table <- function(df_s, fit_flat, fit_weak, fit_inform, label, n_rep = 50) {
+  
+  X_mat <- as.matrix(dplyr::select(df_s, DrivAge, BonusMalus, VehPower,
+                                    VehAge, log_density, VehGas_bin))
+  set.seed(3)
+  
+  # flat
+  alpha_flat <- summarise_draws(fit_flat$post_warmup_draws) %>%
+    filter(variable == "alpha") %>% pull(mean)
+  beta_flat <- summarise_draws(fit_flat$post_warmup_draws) %>%
+    filter(grepl("^beta\\[", variable)) %>% pull(mean)
+  log_lam_flat <- alpha_flat + X_mat %*% beta_flat + log(df_s$Exposure)
+  y_rep_flat <- matrix(
+    rpois(nrow(df_s) * n_rep, lambda = rep(exp(log_lam_flat), n_rep)),
+    nrow = n_rep, byrow = TRUE
+  )
+  
+  # weak
+  alpha_weak <- summarise_draws(fit_weak$post_warmup_draws) %>%
+    filter(variable == "alpha") %>% pull(mean)
+  beta_weak <- summarise_draws(fit_weak$post_warmup_draws) %>%
+    filter(grepl("^beta\\[", variable)) %>% pull(mean)
+  u_weak <- summarise_draws(fit_weak$post_warmup_draws) %>%
+    filter(grepl("^u\\[", variable)) %>%
+    mutate(Region_idx = as.integer(gsub("u\\[|\\]", "", variable))) %>%
+    arrange(Region_idx)
+  log_lam_weak <- alpha_weak + X_mat %*% beta_weak +
+    log(df_s$Exposure) + u_weak$mean[df_s$Region_idx]
+  y_rep_weak <- matrix(
+    rpois(nrow(df_s) * n_rep, lambda = rep(exp(log_lam_weak), n_rep)),
+    nrow = n_rep, byrow = TRUE
+  )
+  
+  # informative
+  alpha_inform <- summarise_draws(fit_inform$post_warmup_draws) %>%
+    filter(variable == "alpha") %>% pull(mean)
+  beta_inform <- summarise_draws(fit_inform$post_warmup_draws) %>%
+    filter(grepl("^beta\\[", variable)) %>% pull(mean)
+  u_inform <- summarise_draws(fit_inform$post_warmup_draws) %>%
+    filter(grepl("^u\\[", variable)) %>%
+    mutate(Region_idx = as.integer(gsub("u\\[|\\]", "", variable))) %>%
+    arrange(Region_idx)
+  log_lam_inform <- alpha_inform + X_mat %*% beta_inform +
+    log(df_s$Exposure) + u_inform$mean[df_s$Region_idx]
+  y_rep_inform <- matrix(
+    rpois(nrow(df_s) * n_rep, lambda = rep(exp(log_lam_inform), n_rep)),
+    nrow = n_rep, byrow = TRUE
+  )
+  
+  # table
+  tibble(
+    Model = c("Complete Pooling (Flat)",
+              "Partial Pooling (Weak Prior)",
+              "Partial Pooling (Informative Prior)"),
+    `Observed Mean`      = mean(df_s$ClaimNb),
+    `Predicted Mean`     = c(mean(y_rep_flat),
+                             mean(y_rep_weak),
+                             mean(y_rep_inform)),
+    `Observed Variance`  = var(df_s$ClaimNb),
+    `Predicted Variance` = c(var(as.vector(y_rep_flat)),
+                             var(as.vector(y_rep_weak)),
+                             var(as.vector(y_rep_inform))),
+    `Observed P(Y=0)`    = mean(df_s$ClaimNb == 0),
+    `Predicted P(Y=0)`   = c(mean(y_rep_flat == 0),
+                             mean(y_rep_weak == 0),
+                             mean(y_rep_inform == 0))
+  ) %>%
+    mutate(across(where(is.numeric), ~round(.x, 4))) %>%
+    knitr::kable(
+      caption   = paste("Posterior Predictive Summary, N =", label),
+      booktabs  = TRUE
+    )
+}
+
+# call for each sample size
+ppc_summary_table(df_500, fit_500_flat, fit_500_weak, fit_500_inform, "500")
+ppc_summary_table(df_2k,  fit_2k_flat,  fit_2k_weak,  fit_2k_inform,  "2000")
+ppc_summary_table(df_10k, fit_10k_flat, fit_10k_weak, fit_10k_inform, "10000")
+ppc_summary_table(df,     fit_flat,     fit_hier_weak, fit_hier_inform, "676k")
+```
+
+
+The posterior predictive checks confirm appropriate fit across all models and sample sizes. All three models closely reproduce the observed claim mean, variance, and proportion of zero-claim policies at every $N$, with predicted quantities barely differing from observed counterparts.. This near-perfect predictive adequacy holds regardless of prior choice on $\sigma_u$: the informative and weak priors produce nearly identical predictive distributions even at $N=500$, where they differ most sharply in their posteriors for $\sigma_u$ itself. The implication is that prior sensitivity in this analysis is confined entirely to the question of how much regional diversity the model attributes to real structural differences versus noise; it does not spread into overall predictive performance, which is governed mainly by the shared covariate structure and the global claim rate.
+
+
+# Bühlmann Credibility
+
+A foundational result in actuarial credibility theory is the \textbf{Bühlmann 
+credibility estimator} (Bühlmann, 1967). Given claim data from $G$ groups, 
+the optimal estimator of group $g$'s true claim rate under squared error loss is:
+
+$$\hat{\mu}_g = Z_g \bar{Y}_g + (1 - Z_g)\bar{Y}$$
+
+where the credibility factor is:
+
+$$Z_g = \frac{n_g}{n_g + k}, \qquad k = \frac{\sigma^2_{\text{within}}}{\sigma^2_{\text{between}}}$$
+
+Here $Z_g \to 1$ when a group has abundant data, trusting the group's own experience, while $Z_g \to 0$ when data is sparse, shrinking toward the collective mean. This is precisely the partial pooling behaviour of the Bayesian hierarchical model. Under certain conditions the posterior mean of the hierarchical model is analytically equivalent to the Bühlmann credibility estimator, connecting a 1967 actuarial result to modern Bayesian inference.
+
+To connect the Bühlmann framework to the fitted models, $k$ must be estimated from the data. The within-group variance $\sigma^2_\text{within}$ is the average Poisson variance across regions. Since claims are Poisson, this equals the average regional claim rate. The between-group variance $\sigma^2_\text{between}$ is the variance of regional raw rates around the global mean, corrected for the sampling noise each regional estimate carries. This correction is necessary because raw regional rates are noisy estimates of true underlying rates, and variance of raw rates overstates true heterogeneity.
+
+```{r funky b}
+buhlmann_k <- function(df_s) {
+  region_stats <- df_s %>%
+    group_by(Region_idx) %>%
+    summarise(
+      n_r       = n(),
+      exposure  = sum(Exposure),
+      claims    = sum(ClaimNb),
+      raw_rate  = claims / exposure
+    )
+
+  global_rate <- sum(region_stats$claims) / sum(region_stats$exposure)
+  G <- nrow(region_stats)
+  n_bar <- mean(region_stats$n_r)
+
+  # within-group variance: E[Var(Y|mu)] = global claim rate under Poisson
+  sigma2_within <- global_rate
+
+  # between-group variance: corrected for sampling noise
+  # Var(raw_rate) = sigma2_between + sigma2_within / n_r
+  # so sigma2_between = Var(raw_rate) - mean(sigma2_within / n_r)
+  raw_var       <- var(region_stats$raw_rate)
+  noise_correction <- mean(sigma2_within / region_stats$n_r)
+  sigma2_between <- max(raw_var - noise_correction, 1e-8)  # floor at 0
+
+  k <- sigma2_within / sigma2_between
+
+  list(
+    k              = k,
+    sigma2_within  = sigma2_within,
+    sigma2_between = sigma2_between,
+    global_rate    = global_rate,
+    region_stats   = region_stats
+  )
+}
+```
+Equivalence is approximate here for two reasons. First, the hierarchical model conditions on six policy-level covariates (driver age, bonus-malus score, vehicle characteristics, population density) while classical Bühlmann operates on raw group means with no covariate adjustment. Second, analytical equivalence requires a Poisson-gamma conjugate structure, whereas the model uses a normal random effect on the log scale. What survives is the qualitative mechanism: both frameworks shrink sparse groups toward the collective mean and trust data-rich groups to speak for themselves, with the degree of shrinkage governed by the same ratio of within-group to between-group variance.
+
+```{r bull comp}
+buhlmann_comparison <- function(df_s, fit_weak, label) {
+  
+  bk <- buhlmann_k(df_s)
+  
+  # credibility factors and estimates per region
+ cred_df <- bk$region_stats %>%
+  mutate(
+    Z_r       = exposure / (exposure + bk$k),
+    buehl_est = Z_r * raw_rate + (1 - Z_r) * bk$global_rate
+  )
+  
+  # hierarchical posterior means
+  u_summary <- summarise_draws(fit_weak$post_warmup_draws) %>%
+    filter(grepl("^u\\[", variable)) %>%
+    mutate(Region_idx = as.integer(gsub("u\\[|\\]", "", variable)))
+  
+  alpha_weak <- summarise_draws(fit_weak$post_warmup_draws) %>%
+    filter(variable == "alpha") %>% pull(mean)
+  
+  comparison_df <- cred_df %>%
+    left_join(dplyr::select(u_summary, Region_idx, mean), 
+              by = "Region_idx") %>%
+    left_join(region_lookup, by = "Region_idx") %>%
+    mutate(
+      hier_est   = exp(alpha_weak + mean),
+      difference = round(hier_est - buehl_est, 4)
+    ) %>%
+    dplyr::select(Region, n_r, Z_r, raw_rate, 
+                  buehl_est, hier_est, difference) %>%
+    arrange(desc(n_r))
+  
+  knitr::kable(
+    comparison_df,
+    digits  = 4,
+    caption = paste("Bühlmann vs. Hierarchical Posterior Means at N =", label),
+    col.names = c("Region", "n", "Z_r", 
+                  "Raw Rate", "Bühlmann", 
+                  "Hierarchical", "Difference"),
+    booktabs = TRUE
+  )
+}
+
+buhlmann_comparison(df_500,  fit_500_weak,  "500")
+```
+At $N = 500$ the comparison is dominated by sampling artifacts rather than genuine model disagreement. Twelve of $21$ regions record zero claims in the subsample, producing raw rates of zero and Bühlmann estimates that are essentially $(1 - Z_r) \times \bar{Y}$ - pure shrinkage toward the global mean with no regional signal. At the other extreme, Champagne-Ardenne draws one or two claims on two policies, inflating its raw rate to $1.099$ and its Bühlmann estimate to $0.362$; even with a credibility factor of only $0.252$, the extreme raw rate is enough to pull the estimate far above any plausible regional risk. The hierarchical model is insulated from both pathologies by the covariate structure and the prior on $\sigma_u$, which prevent any single region from straying far from a plausible range. The large differences in the rightmost column at $N = 500$ therefore measure not the distance between the two frameworks but the distance between data reliability and model-stabilised inference. This distinction collapses as $N$ grows and the zero-claim regions accumulate enough exposure to produce stable rates.
+```{r bcm}
+buhlmann_comparison(df_2k,   fit_2k_weak,   "2000")
+```
+At $N=2,000$ the comparison stabilises considerably. The zero-claim pathology is now confined to three regions (Picardie, Auvergne, Alsace) rather than twelve, and the extreme raw rates that destabilised Champagne-Ardenne and Limousin at $N=500$ have balanced, though Champagne-Ardenne's raw rate of $0.303$ and Franche-Comté's $0.426$ remain unreliable on their small samples. Credibility factors of $0.164$ and $0.122$ correctly assign them little weight, pulling their Bühlmann estimates back toward the global mean. Where the data is adequate — the eight largest regions each with over $100$ policies. The Bühlmann and hierarchical estimates are already close, with differences typically below $0.015$. The most persistent source of issue is Languedoc-Roussillon, whose raw rate of $0.025$ is implausibly low given its full-sample rate of $0.105$; the Bühlmann estimator partially corrects this to $0.046$ while the hierarchical model, returns $0.087$. This pattern, the hierarchical model outperforming Bühlmann in regions whose subsample composition is unrepresentative of their true risk profile, is the consequence of conditioning on covariates, and it is exactly what the approximation caveat anticipates.
+
+```{r bcl}
+buhlmann_comparison(df_10k,  fit_10k_weak,  "10000")
+```
+At $N = 10,000$ the sampling problems that dominated the smaller subsamples have largely resolved. Only Alsace records zero claims, and the raw rates across the remaining $20$ regions are broadly consistent with their full-sample values. The credibility factors now span a meaningful range, from $0.097$ for Franche-Comté ($20$ policies) to $0.951$ for Centre ($2,372$ policies), and the Bühlmann estimator is doing genuine work rather than simply collapsing toward the global mean. Where $Z_r$ is high, the eight largest regions, the two estimators agree closely, with differences typically below $0.012$. The remaining disagreements are concentrated in two places: regions with genuinely extreme underlying rates (Provence-Alpes-Côtes-d'Azur at $0.112$ hierarchical vs. $0.139$ Bühlmann, Midi-Pyrénées at $0.107$ vs. $0.145$) where the covariate adjustment pulls the hierarchical estimate back toward the global mean, and regions small enough like Haute-Normandie and Limousin that the subsample remains unrepresentative. The overall mean absolute difference has fallen substantially relative to $N = 2,000$, and the two frameworks are now telling the same story about which regions are genuinely high and low-risk, differing only in the magnitude of the deviation they attribute to each.
+
+```{r bcf}
+buhlmann_comparison(df,      fit_hier_weak, "676k")
+```
+At $N = 676,789$ the comparison reaches its clearest form. Credibility factors are uniformly high, ranging from $0.572$ for Franche-Comté to $0.996$ for Centre, meaning every region is being trusted heavily over the global mean, and the Bühlmann estimates are essentially identical to the raw rates. The structural zeros, extreme subsamples, and compositional imbalances that complicated the smaller samples have vanished entirely. What remains is a clean, interpretable result: the systematic gap between the Bühlmann estimate and the hierarchical posterior mean is now driven almost entirely by the covariate adjustment. Île-de-France is the clearest example, with a raw rate of $0.132$ and Bühlmann estimate of $0.132$ both reflect a genuinely high-risk region, but the hierarchical model returns $0.101$, suggesting that much of Île-de-France's excess claims are explained by its portfolio composition (younger drivers, higher bonus-malus scores, higher population density) rather than regional risk beyond what the covariates capture. The same logic applies in reverse to Centre, whose hierarchical estimate of $0.105$ exceeds its raw rate of $0.090$, implying its portfolio skews toward lower-risk profiles. At full sample the Bühlmann-hierarchical difference is therefore not noise but signal; it measures precisely the contribution of covariate adjustment to regional rate estimation, and it is the most honest version of the approximation caveat stated earlier.
+
+# Summary and Conclusions
+
+This analysis set out to answer a specific question about a French motor insurance portfolio: does hierarchical Bayesian modeling improve estimation of regional claim frequencies relative to a flat pooled model, and under what data conditions does the choice of prior on regional variance matter? The empirical answer is clear, but the more interesting result is what the analysis reveals about hierarchical modeling as a general inferential framework.
+
+The direct answer to the research question is yes - partial pooling delivers more coherent regional estimates than complete pooling at every sample size examined, and it does so in a way that is interpretable through the classical Bühlmann credibility framework. At full sample the posterior mean of $\sigma_u$ converges to approximately $0.085$ under both priors, implying that genuine regional risk varies by roughly $e^{0.085} \approx 9\%$ around the global mean once covariate composition is accounted for. This residual regional heterogeneity is real and structurally meaningful — it is not explained away by driver age, vehicle characteristics, or population density — and the hierarchical model captures it while the flat model remains blind to it.
+
+The more substantive finding concerns the interplay between sample size, prior choice, and the identifiability of $\sigma_u$. At $N = 500$ the informative prior dominates inference entirely, effectively imposing complete pooling regardless of model specification — the likelihood is too weak to overcome the tight prior belief that regions are homogeneous. By $N=2,000$ the data begins to push back, by $N=10,000$ the two hierarchical posteriors are visibly converging, and at full sample size the distinction between the two priors is negligible, confirming the Bernstein-von Mises theorem empirically. What the $\sigma_u$ density plots make vivid - in a way that asymptotic theory alone cannot - is the speed of this convergence and the shape of the transition. Prior sensitivity does not fade gradually and uniformly; it collapses once the likelihood accumulates enough group-level information to overwhelm it.
+
+The deeper reason for this behaviour is a structural feature of hierarchical models that generalises far beyond this dataset. $\sigma_u$ is identified by the number of groups, not the number of observations. In this analysis that number is $21$, and it does not grow as $N$ increases from $500$ to $676,789$. Even at full sample size, the prior on $\sigma_u$ is being updated by essentially $21$ sufficient statistics - very precise ones, but $21$ nonetheless. This group-level bottleneck applies wherever hierarchical models are used: meta-analyses with few studies, longitudinal designs with few subjects, batch effects in genomics, multilevel models with sparse higher-level units. The practical implication is uncomfortable but important — prior choice on variance components matters most precisely when it is least verifiable, in the small-portfolio setting where the data cannot adjudicate between competing beliefs about between-group heterogeneity.
+
+The Bühlmann comparison sharpens this conclusion by separating two sources of shrinkage that the hierarchical model combines. At small $N$, differences between the Bühlmann and hierarchical estimates are dominated by sampling pathology — zero-claim regions, extreme raw rates on one or two policies — from which the hierarchical model is insulated by its covariate structure and prior on $\sigma_u$. At full sample, these pathologies vanish and a clean residual emerges: the systematic gap between the two estimators measures precisely the contribution of covariate adjustment to regional rate estimation. Île-de-France's apparent excess risk shrinks substantially once its portfolio composition is conditioned on; Centre's apparent deficit reverses for the same reason. Classical Bühlmann, operating on raw group means, cannot see this — it attributes the entire deviation from the global mean to genuine regional risk. The hierarchical model disaggregates that deviation into a covariate-explained component and a residual regional effect, which is a strictly more informative decomposition.
+
+Three conclusions generalise beyond this analysis. First, hierarchical Bayes and credibility theory are not competing frameworks but complementary ones — the former subsumes the latter while adding covariate adjustment, full posterior uncertainty quantification, and the ability to propagate prior beliefs about between-group variance into inference. Second, the Bernstein-von Mises theorem is not merely an asymptotic guarantee but an empirically observable phenomenon: the $\sigma_u$ density plots across four sample sizes are a visual demonstration of a prior being overwhelmed, with a transition speed that depends on the number of groups rather than the total sample size. Third, prior sensitivity analysis is most valuable precisely where it is most uncomfortable — not as a robustness check on an already-identified parameter, but as an honest acknowledgment that when data cannot adjudicate between priors, the analyst's subjective beliefs about between-group heterogeneity are the dominant driver of inference. In such settings the choice of prior on $\sigma_u$ is not a technical detail but a substantive actuarial judgment about how similar regions are expected to be before the data speaks — and one that should be made explicitly, defended on subject-matter grounds, and reported transparently.
